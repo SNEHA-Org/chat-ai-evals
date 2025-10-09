@@ -10,7 +10,7 @@ See README in your previous message for full instructions. This package includes
 
 
 python3 glific_eval_runner.py \
-  --env-file ~/vinod.env \
+  --env-file ~/.env \
   --sheet-id yyyy \
   --worksheet "Golden Q&A" \
   --service-account ~/sneha-evals.json \
