@@ -1,0 +1,16 @@
+{
+  "sheet_id": "135TTaPNyyhkXKGe8pdmGJ0YuUHOMFD7l8RUCGIdb-0E",
+  "worksheet": "Golden Q&A",
+  "model": "gpt-4o-mini",
+  "embedding_model": "text-embedding-3-large",
+  "judge_model": "gpt-4o-mini",
+  "runs": 1,
+  "temperature": 0.01,
+  "top_p": 1,
+  "max_tokens": 512,
+  "vector_store_id": "vs_67a9de6638888191beb37c06f84e1a88",
+  "api_mode": "responses",
+  "assistant_id": null,
+  "context_precision_threshold": 0.7,
+  "timestamp": 1759997312
+}
