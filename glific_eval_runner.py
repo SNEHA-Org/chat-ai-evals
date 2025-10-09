@@ -540,7 +540,7 @@ class OpenAIClient:
                 tools=[{
                     "type": "file_search",
                     "vector_store_ids": [self.vector_store_id],
-                    "max_num_results": 5
+                    "max_num_results": 20
                 }],
                 tool_choice={
                     "type": "file_search"
@@ -555,7 +555,9 @@ class OpenAIClient:
         resp = retry_with_backoff(call_with_attachments, 
                                 on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}"))
         end = time.time()
-
+        
+        print(f"{question}: {resp} ")
+        
         # Usage from typed object
         try:
             usage = getattr(resp, "usage", None) or {}
