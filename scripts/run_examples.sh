@@ -1,8 +1,19 @@
 
 #!/usr/bin/env bash
 
+#For CSV RUNS
+python3 glific_eval_runner.py \
+  --env-file ~/.env \
+  --model gpt-4o-mini \
+  --analysis-model gpt-4o-mini \
+  --embedding-model text-embedding-3-large \
+  --runs 1 \
+  --temperature 0.01 \
+  --vector-store-id vs_67a9de6638888191beb37c06f84e1a88 \
+  --system-prompt prompts/prompt_new.md --analysis-to-sheet
 
-# For GSHEET runs
+
+# For GSHEET runs (DEPRECATED)
 # Responses API with RAG
 python glific_eval_runner.py   --env-file .env   --sheet-id SHEET_ID   --worksheet "Sheet1"   --service-account /path/to/service_account.json   --output results.xlsx   --runs 20   --vector-store-id vs_abc123   --push-to-sheet   --analysis-to-sheet
 
@@ -18,14 +29,12 @@ python3 glific_eval_runner.py \
   --temperature 0.01 \
   --vector-store-id vs_xxxxx \
   --analysis-to-sheet
-
   (prompt is embedded in the python file)
-
 
 # Assistants API (strict; requires existing assistant)
 python glific_eval_runner.py   --env-file .env   --sheet-id SHEET_ID   --worksheet "Sheet1"   --service-account /path/to/service_account.json   --output results.xlsx   --runs 20   --api-mode assistants   --assistant-id asst_12345abc   --vector-store-id vs_abc123   --push-to-sheet   --analysis-to-sheet
 
 
 
-#For CSV RUNS
+
 
