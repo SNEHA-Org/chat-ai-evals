@@ -15,13 +15,13 @@ LLM-as-judge (referenced) metrics
 5) Completeness (-5..5): thoroughly addresses the user's concern while staying in scope.
 
 Notes
-- Input: Google Sheet (service account). Needs a 'question' column. 'reference_answer' recommended for metric #1.
+- Input: CSV file (columns: no, question, reference_answer). Default is golden_q_a.csv; override via --input.
 - Runs N passes per question (default 20) using either:
     (A) Responses API (default). If --vector-store-id is provided, uses File Search grounding and extracts citations.
     (B) Assistants API (--api-mode assistants). STRICT reuse: requires --assistant-id and will NOT create/update.
       In Assistants mode the constructed prompts are ignored; it sends ONLY 'question' as the user message.
-- Outputs Excel and optional Google Sheet tabs with timestamped names.
-- Analysis tab (optional) summarizes these metrics only.
+- Outputs Excel/JSON/Markdown artifacts in a timestamped directory when --output is omitted.
+- Analysis tab and KPI snapshot are generated into both Excel and Markdown sidecar files.
 - Seeds are used only for Chat Completions (judge). Responses & Assistants do not accept 'seed'.
 
 """
@@ -48,19 +48,6 @@ except Exception:
 from dotenv import load_dotenv
 
 import pandas as pd
-
-# Google Sheets
-import gspread
-from google.oauth2.service_account import Credentials
-
-# Optional Google Sheets formatting
-try:
-    from gspread_formatting import (
-        format_cell_ranges, CellFormat, TextFormat, set_frozen, set_column_widths
-    )
-    HAS_GS_FORMAT = True
-except Exception:
-    HAS_GS_FORMAT = False
 
 # OpenAI modern SDK
 try:
@@ -203,47 +190,106 @@ def timestamp_str(tzname: Optional[str] = None) -> str:
     return now.strftime("%Y%m%d_%H%M%S")
 
 
-def df_to_gsheet(gc, sheet_id: str, title: str, df: pd.DataFrame, logger=None):
-    sh = gc.open_by_key(sheet_id)
-    ws_title = title[:100]
-    rows = max(len(df) + 1, 2)
-    cols = max(len(df.columns), 1)
-    ws = sh.add_worksheet(title=ws_title, rows=rows, cols=cols)
-    values = [list(df.columns)] + df.fillna("").astype(str).values.tolist()
-    ws.update(values)
-    try:
-        ws.freeze(rows=1)
-    except Exception:
-        try:
-            if HAS_GS_FORMAT:
-                set_frozen(ws, rows=1, cols=0)
-        except Exception:
-            pass
-    # Basic formatting
-    if HAS_GS_FORMAT:
-        try:
-            header_fmt = CellFormat(textFormat=TextFormat(bold=True))
-            end_col_letter = chr(64 + cols) if cols <= 26 else "Z"
-            format_cell_ranges(ws, [(f"A1:{end_col_letter}1", header_fmt)])
-            wrap_fmt = CellFormat(wrapStrategy="WRAP")
-            format_cell_ranges(ws, [(f"A1:{end_col_letter}{rows}", wrap_fmt)])
-            long_cols = [i for i, c in enumerate(df.columns, start=1) if c.lower() in {"response_text","question","reference_answer","user_text"}]
-            widths = {i: 150 for i in range(1, cols+1)}
-            for i in long_cols:
-                widths[i] = 400
-            set_column_widths(ws, widths)
-        except Exception as e:
-            if logger:
-                logger.warning(f"Formatting skipped: {e}")
-    return ws_title
+def load_input_dataframe(csv_path: str) -> pd.DataFrame:
+    """Load evaluation prompts from a CSV with columns: no, question, reference_answer."""
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Input CSV not found: {csv_path}")
+    df = pd.read_csv(path)
+    if df.empty:
+        raise ValueError("Input CSV has no rows.")
+    lower_cols = {c: c.lower().strip() for c in df.columns}
+    df.rename(columns=lower_cols, inplace=True)
+    required = {"no", "question", "reference_answer"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Input CSV must contain columns: no, question, reference_answer. Missing: "
+            + ", ".join(sorted(missing))
+        )
+    df = df.copy()
+    df.sort_values(by="no", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 
-def apply_excel_formatting(writer, df_summary: pd.DataFrame, df_runs: pd.DataFrame):
+def resolve_output_paths(
+    output_arg: Optional[str],
+    prompt_file: Optional[str],
+    tzname: Optional[str] = None,
+) -> Tuple[Path, Path, Path, str]:
+    """Compute result/config/analysis paths and ensure directories exist."""
+    if tzname and ZoneInfo:
+        now = datetime.now(ZoneInfo(tzname))
+    else:
+        now = datetime.now()
+    suffix = now.strftime("%Y-%m-%d_%H%M")
+    prompt_name = Path(prompt_file).stem if prompt_file else "defaultprompt"
+
+    if output_arg:
+        candidate = Path(output_arg)
+        treat_as_dir = candidate.is_dir() or str(output_arg).endswith(os.sep)
+        if not candidate.exists() and candidate.suffix == "":
+            treat_as_dir = True
+        if treat_as_dir:
+            output_dir = candidate
+            output_dir.mkdir(parents=True, exist_ok=True)
+            results_path = output_dir / f"results_{suffix}.xlsx"
+        else:
+            output_dir = candidate.parent
+            output_dir.mkdir(parents=True, exist_ok=True)
+            results_path = candidate if candidate.suffix else candidate.with_suffix(".xlsx")
+            if results_path.suffix.lower() != ".xlsx":
+                results_path = results_path.with_suffix(".xlsx")
+    else:
+        output_dir = Path("output") / f"{prompt_name or 'defaultprompt'}_{suffix}"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        results_path = output_dir / f"results_{suffix}.xlsx"
+
+    config_path = results_path.parent / f"config_{suffix}.json"
+    analysis_path = results_path.parent / f"analysis_{suffix}.md"
+    return results_path, config_path, analysis_path, suffix
+
+
+def config_dataframe(cfg: Dict[str, Any]) -> pd.DataFrame:
+    """Flatten a nested config dictionary into key/value rows."""
+
+    rows: List[Dict[str, Any]] = []
+
+    def _flatten(prefix: str, value: Any) -> None:
+        if isinstance(value, dict):
+            for key, val in value.items():
+                next_prefix = f"{prefix}.{key}" if prefix else key
+                _flatten(next_prefix, val)
+        else:
+            if isinstance(value, (list, dict)):
+                display = json.dumps(value, ensure_ascii=False)
+            else:
+                display = value
+            rows.append({"key": prefix, "value": display})
+
+    _flatten("", cfg)
+    return pd.DataFrame(rows)
+
+
+def apply_excel_formatting(
+    writer,
+    df_summary: pd.DataFrame,
+    df_runs: pd.DataFrame,
+    df_kpis: Optional[pd.DataFrame] = None,
+    df_config: Optional[pd.DataFrame] = None,
+):
     try:
         ws = writer.sheets.get("summary")
         if ws:
             ws.freeze_panes = "A2"
         ws = writer.sheets.get("runs")
+        if ws:
+            ws.freeze_panes = "A2"
+        ws = writer.sheets.get("kpis")
+        if ws:
+            ws.freeze_panes = "A2"
+        ws = writer.sheets.get("config")
         if ws:
             ws.freeze_panes = "A2"
         from openpyxl.utils import get_column_letter
@@ -258,6 +304,8 @@ def apply_excel_formatting(writer, df_summary: pd.DataFrame, df_runs: pd.DataFra
                 ws.column_dimensions[letter].width = width
         set_width("summary", df_summary, {"question"})
         set_width("runs", df_runs, {"question","response_text","reference_answer","user_text"})
+        if df_config is not None:
+            set_width("config", df_config, {"value"})
     except Exception:
         pass
 
@@ -317,76 +365,6 @@ Skip any metric that is null.
         max_tokens=max_tokens,
     )
     return (resp.choices[0].message.content or "").strip()
-
-
-def text_to_gsheet(gc, sheet_id: str, title: str, text: str, logger=None):
-    sh = gc.open_by_key(sheet_id)
-    ws_title = title[:100]
-    lines = text.splitlines() or ["(no analysis)"]
-    rows = max(len(lines) + 2, 4)
-    ws = sh.add_worksheet(title=ws_title, rows=rows, cols=1)
-    values = [["Executive Analysis"], [""]] + [[line] for line in lines]
-    ws.update(values)
-    try:
-        ws.freeze(rows=2)
-    except Exception:
-        pass
-    if HAS_GS_FORMAT:
-        try:
-            header_fmt = CellFormat(textFormat=TextFormat(bold=True))
-            format_cell_ranges(ws, [("A1:A1", header_fmt)])
-            wrap_fmt = CellFormat(wrapStrategy="WRAP")
-            format_cell_ranges(ws, [(f"A1:A{rows}", wrap_fmt)])
-            set_column_widths(ws, {1: 100})
-        except Exception as e:
-            if logger:
-                logger.warning(f"Analysis formatting skipped: {e}")
-    return ws_title
-
-
-# ----------------------------
-# Google Sheets helpers
-# ----------------------------
-
-def load_sheet_as_dataframe(sheet_id: str, worksheet: str, sa_path: str, write_access: bool = False) -> pd.DataFrame:
-    scopes = [
-        "https://www.googleapis.com/auth/spreadsheets.readonly",
-        "https://www.googleapis.com/auth/drive.readonly",
-    ] if not write_access else [
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ]
-    creds = Credentials.from_service_account_file(sa_path, scopes=scopes)
-    gc = gspread.authorize(creds)
-
-    try:
-        sh = gc.open_by_key(sheet_id)
-    except gspread.SpreadsheetNotFound:
-        raise SystemExit(
-            "SpreadsheetNotFound (404):\n"
-            "- Use ONLY the ID between /d/ and /edit (not full URL).\n"
-            "- Share the sheet with the service account client_email.\n"
-            "- Enable Sheets & Drive APIs; check Shared Drive permissions."
-        )
-    try:
-        ws = sh.worksheet(worksheet)
-    except gspread.WorksheetNotFound:
-        raise SystemExit(
-            f"WorksheetNotFound: No tab named '{worksheet}'. "
-            f"Available tabs: {', '.join(w.title for w in sh.worksheets())}"
-        )
-
-    records = ws.get_all_records()
-    df = pd.DataFrame(records)
-    lower_cols = {c: c.lower().strip() for c in df.columns}
-    df.rename(columns=lower_cols, inplace=True)
-    if "question" not in df.columns:
-        raise ValueError("Input sheet must contain a 'question' column.")
-    if "reference_answer" not in df.columns:
-        df["reference_answer"] = None
-    return df
-
-
 # ----------------------------
 # OpenAI helpers
 # ----------------------------
@@ -449,105 +427,35 @@ class OpenAIClient:
         if not self.vector_store_id:
             raise ValueError("vector_store_id is required for rag_response")
 
+        messages = [
+            {"role": "system", "content": system or ""},
+            {"role": "user", "content": question},
+        ]
+
         def call_with_attachments():
             return self.client.responses.create(
                 model=self.model,
-                # Put the system + user as two messages
-                input=[
-                    {
-                        "role": "system",
-                        # "content": (
-                        #     "You are SNEHA DIDI. You’re a chatbot respond with to queries from women located in low economic "
-                        #     "urban settlements on early childhood healthcare, pregnancy, government schemes and other related issues. "
-                        #     "The women asking questions are not educated, will send messages with typos or incomplete information. "
-                        #     "They need responses in language a 5 year old will understand, using simple and casual words, comprehensive, "
-                        #     "yet concise - a maximum  of 4-5 lines per response.\n\n"
-                        #     "# Rules of responding #\n"
-                        #     "1. If the question is unclear, ask 1-2 clarifying questions to better understand their needs/ gather more context. "
-                        #     "For example, if the user asks any questions related to baby, ask questions like age of the baby, what they want to know etc before finding the answer.\n"
-                        #     "2. **What you share must be verifiable. So strictly limit your responses to what is there in the files in your knowledge base**. "
-                        #     "If there is a supporting video link, share that as well. **Do not respond from Memory or the Internet or Hallucinate**.\n"
-                        #     "3. **If you cannot find the answer in the documents, politely respond by saying** “I do not have enough information to answer your question” in romanized hindi.\n"
-                        #     "4. Maintain the style of messaging the user message you with.\n"
-                        #     "5. If you get emojis/ generic greeting/ acknowledgment messages in any language(like yes, thank you, ok, ji, G, hi, bye, theek hai), respond according to their message.\n"
-                        #     "6. You offer 'jaankari', not 'madad'\n\n"
-                        #     "# Language handling #\n"
-                        #     "1. User can send messages in Hindi (Devanagari script) or Romanised Hindi (English script with transliterated or translated hindi words). "
-                        #     "If the message is in Devanagari script, strictly respond in Hindi using Devanagari script. If its in romanised Hindi, strictly use the same. "
-                        #     "If the ask in English, strictly respond in romanised Hindi.\n"
-                        #     "2. Avoid using the \"!\" in your messages.\n"
-                        #     "3. **Do not use numbered lists** in your response. **Bullet point with un-numbered lists**.\n"
-                        #     "4. Topics you **do NOT** respond to and “I do not have enough information to answer your question” - children aged 1, pregnancy sex questions, family planning\n"
-                        #     "5. Use the hindi word for baby, iron (the metal in our blood stream)\n"
-                        #     "6. Use simpler words than unclear, specific, cost, growth, meals, healthy, tummy, facilities, seasonal, hydrated, bleeding, fever, guava, organs, structure, placenta, junk, variety, mashed, quantity, soft, mackerel, salmon, mercury, absorb, legumes, citrus - use colloquial words the women can understand."
-                        # ),
-                        "content": ( """You are SNEHA DIDI — a chatbot for women in low-income urban settlements on early childhood care, pregnancy, govt schemes, and related issues.
-
-                                        STYLE
-                                        - Match user’s script: Devanagari → answer in Hindi; Romanised Hindi → answer in Romanised Hindi; English → answer in Romanised Hindi.
-                                        - Simple words a 5-year-old understands. Max 5–6 short lines. No “!” and no numbered lists (use plain bullets only).
-                                        - As much as possible translate english words into simple hindi words 
-                                        - You offer “jaankari”, not “madad”.
-
-                                        SCOPE & SAFETY
-                                        - Only answer from provided files (vector search/file search). If info isn’t in KB, say: “Mere paas iska uttar nahin hai. Kripya apne najdik ke health facility/doctor se sampark karein.”
-                                        - if no quotes exist in retrieved content in citations you must provide followup or respond  as "“Mere paas poori jaankari nahi hai is sawaal ka.”. Do not refer to internet or from your Memory. 
-                                        - Do NOT retreive answers for: questions concerning children past age 1, pregnancy sex questions, family planning, sonography for sex determination. Use the same "Mere paas iska uttar nahin hai. Kripya apne najdik ke CO/health facility/doctor se sampark karein." line.
-                                        - Watch red flags (severe bleeding, fever, unconscious, seizures, severe pain, poison, suicidal). If present, first line advises urgent care and reroute as "Kripya apne najdik ke CO/health facility/doctor se sampark karein."
-
-                                        CLARIFICATION
-                                        - If the question is unclear, ask 1–2 short follow-ups first (e.g., for baby questions: age, symptoms, since when).
-                                        - start with followup question in answer lines and then provide more generic information in subsequent answer lines
-                                        - Otherwise answer directly, then ask exactly one brief follow-up to keep context going.
-
-                                        CITATIONS
-                                        - Every factual claim must be supported by quotes from retrieved context. Include 2–4 short quotes (≤50 words) with source IDs. 
-
-                                        OUTPUT (JSON)
-                                        Return ONLY valid JSON:
-
-                                        {
-                                        "answer_lines": ["...", "...", "..."],        // 5–7 short lines, bullets allowed but no numbers
-                                        "citations": [                                 // optional; empty if none available
-                                            {"source_id": "doc_or_file_id", "quote": "short exact quote"},
-                                            ...
-                                        ],
-                                        "follow_up": "one brief question to clarify/continue",
-                                        "urgency": "none | advise_clinic_24h | urgent_now"
-                                        }
-                                    """
-                        )
-
-                    },
-                    {
-                        "role": "user",
-                        # keep this simple; strings are accepted here
-                        "content": question,
-                    },
-                ],
-                # Tools are declared top-level
+                input=messages,
                 tools=[{
                     "type": "file_search",
                     "vector_store_ids": [self.vector_store_id],
-                    "max_num_results": 5
+                    "max_num_results": 5,
                 }],
-                tool_choice={
-                    "type": "file_search"
-                },
+                tool_choice={"type": "file_search"},
                 temperature=self.temperature,
                 top_p=self.top_p,
                 max_output_tokens=self.max_tokens,
             )
 
-
         start = time.time()
-        resp = retry_with_backoff(call_with_attachments, on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}"))
+        resp = retry_with_backoff(
+            call_with_attachments,
+            on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}")
+        )
         end = time.time()
 
         print(f"{question}: {resp} ")
-        end = time.time()
 
-        # usage from typed object
         try:
             usage = getattr(resp, "usage", None) or {}
             prompt_toks = getattr(usage, "input_tokens", None)
@@ -556,8 +464,7 @@ class OpenAIClient:
             prompt_toks = None
             completion_toks = None
 
-        # robust text + citations extraction from typed output
-        text, quotes, file_ids,follow_up,urgency = self._extract_text_and_citations_from_response_json(resp)
+        text, quotes, file_ids, follow_up, urgency = self._extract_text_and_citations_from_response_json(resp)
         total_toks = (prompt_toks or 0) + (completion_toks or 0)
 
         print(f"{text}: {quotes} ")
@@ -569,8 +476,8 @@ class OpenAIClient:
             "completion_tokens": completion_toks,
             "total_tokens": total_toks if total_toks else None,
             "citations": [{"quote": q, "file_id": f} for q, f in zip(quotes, file_ids)],
-            "urgency":urgency,
-            "follow_up":follow_up
+            "urgency": urgency,
+            "follow_up": follow_up,
         }
 
     @staticmethod
@@ -1093,43 +1000,59 @@ def evaluate_questions(
 # ----------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run LLM evals (Semantic Alignment, Contextual Precision, Safety/Clarity/Completeness) from Google Sheets → Excel/Sheet.")
-    p.add_argument("--sheet-id", required=True, help="Google Sheet ID (the long string in the URL).")
-    p.add_argument("--worksheet", default="Sheet1", help="Worksheet/Tab name. Default: Sheet1")
-    p.add_argument("--service-account", required=True, help="Path to Google service account JSON key.")
-    p.add_argument("--output", required=True, help="Path to output .xlsx file.")
+    p = argparse.ArgumentParser(
+        description="Run LLM evals (Semantic Alignment, Contextual Precision, Safety/Clarity/Completeness) from a CSV file."
+    )
+    p.add_argument(
+        "--input",
+        default="golden_q_a.csv",
+        help="Path to input CSV with columns: no, question, reference_answer (default: golden_q_a.csv).",
+    )
+    p.add_argument(
+        "--system-prompt-file",
+        required=True,
+        help="Path to the system prompt file used for Responses/Chat modes.",
+    )
+    p.add_argument(
+        "--output",
+        default=None,
+        help="Optional path to results .xlsx file or directory. When omitted uses output/<prompt>_<timestamp>/results_<timestamp>.xlsx.",
+    )
     p.add_argument("--model", default="gpt-4o-mini", help="OpenAI model for answers (Responses/Assistants/Chat).")
     p.add_argument("--embedding-model", default="text-embedding-3-large", help="OpenAI embedding model.")
-    p.add_argument("--runs", type=int, default=5, help="Number of runs per question. Default: 20")
+    p.add_argument("--runs", type=int, default=5, help="Number of runs per question. Default: 5")
     p.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature (for Responses/Chat).")
     p.add_argument("--top-p", type=float, default=1, help="Top-p (for Responses/Chat).")
     p.add_argument("--max-tokens", type=int, default=512, help="Max tokens for the completion.")
-    p.add_argument("--system-prompt", default=None, help="Optional system prompt (Responses/Chat mode only).")
     p.add_argument("--vector-store-id", default=None, help="If set, enable File Search with this Vector Store ID (Responses/Assistants).")
-    # Thresholds
     p.add_argument("--cosine-threshold", type=float, default=0.70, help="Reserved for future; semantic alignment uses full answer cosine.")
-    p.add_argument("--context-precision-threshold", type=float, default=0.7, help="Sentence~quote cosine threshold for support.")
-    # Logging + env + push
-    p.add_argument("--push-to-sheet", action="store_true", help="Write results back into the same Google Sheet as new tabs.")
-    p.add_argument("--sheet-title-prefix", default="eval_", help="Prefix for result worksheet names.")
-    p.add_argument("--timezone", default="Asia/Kolkata", help="Timezone for timestamp in sheet/tab names.")
+    p.add_argument(
+        "--context-precision-threshold",
+        type=float,
+        default=0.7,
+        help="Sentence~quote cosine threshold for contextual precision support.",
+    )
     p.add_argument("--log-file", default=None, help="Optional path to write a log file.")
     p.add_argument("--env-file", default=".env", help="Path to a .env file with OPENAI_API_KEY (default: .env)")
-    # Analysis
-    p.add_argument("--analysis-to-sheet", action="store_true", help="Generate LLM executive analysis and push to Google Sheet + Excel.")
+    p.add_argument("--timezone", default="Asia/Kolkata", help="Timezone for timestamps in default output directories.")
     p.add_argument("--analysis-model", default="gpt-4o-mini", help="Model for LLM analysis narrative.")
     p.add_argument("--analysis-max-tokens", type=int, default=1024, help="Max tokens for analysis output.")
-    p.add_argument("--analysis-title-prefix", default="eval_analysis_", help="Prefix for analysis worksheet name.")
-    # User prompt prefix/suffix (Responses/Chat only)
     p.add_argument("--user-prefix", default=None, help="Fixed user prompt prefix to prepend to each question/prompt.")
     p.add_argument("--user-prefix-file", default=None, help="Path to a file whose contents are used as user prompt prefix.")
     p.add_argument("--user-suffix", default=None, help="Fixed user prompt suffix to append to each question/prompt.")
     p.add_argument("--user-suffix-file", default=None, help="Path to a file whose contents are used as user prompt suffix.")
-    # API mode + Assistants controls
-    p.add_argument("--api-mode", choices=["responses","assistants","chat"], default="responses", help="Use Responses (default), Assistants (strict reuse), or plain Chat (no RAG).")
+    p.add_argument(
+        "--api-mode",
+        choices=["responses", "assistants", "chat"],
+        default="responses",
+        help="Use Responses (default), Assistants (strict reuse), or plain Chat (no RAG).",
+    )
     p.add_argument("--assistant-id", default=None, help="Existing Assistant ID (Assistants mode). Will NOT create/update.")
-    # ADDED: Separate judge model parameter
-    p.add_argument("--judge-model", default="gpt-4o-mini", help="Model for LLM-as-judge scoring (Safety/Clarity/Completeness). Default: gpt-4o-mini")
+    p.add_argument(
+        "--judge-model",
+        default="gpt-4o-mini",
+        help="Model for LLM-as-judge scoring (Safety/Clarity/Completeness). Default: gpt-4o-mini",
+    )
     return p.parse_args()
 
 
@@ -1143,9 +1066,25 @@ def main():
 
     # Logger
     logger = setup_logger(args.log_file)
-    logger.info("Loading sheet...")
-    df = load_sheet_as_dataframe(args.sheet_id, args.worksheet, args.service_account, write_access=args.push_to_sheet)
+
+    logger.info(f"Loading prompts from CSV: {args.input}")
+    try:
+        df = load_input_dataframe(args.input)
+    except Exception as exc:
+        raise SystemExit(f"Failed to load input CSV: {exc}")
     logger.info(f"Loaded {len(df)} rows.")
+
+    try:
+        system_prompt = Path(args.system_prompt_file).read_text(encoding="utf-8").strip()
+    except Exception as exc:
+        raise SystemExit(f"Failed to read system prompt file: {exc}")
+
+    results_path, config_path, analysis_path, suffix = resolve_output_paths(
+        args.output, args.system_prompt_file, args.timezone
+    )
+    logger.info(f"Results Excel will be written to {results_path}")
+    logger.info(f"Analysis markdown will be written to {analysis_path}")
+    logger.info(f"Config snapshot will be written to {config_path}")
 
     # OpenAI client
     oaiclient = OpenAIClient(
@@ -1155,7 +1094,7 @@ def main():
         top_p=args.top_p,
         max_tokens=args.max_tokens,
         vector_store_id=args.vector_store_id,
-        judge_model=args.judge_model,  # CHANGED: Use separate judge_model parameter
+        judge_model=args.judge_model,
         judge_temperature=0.01,
     )
 
@@ -1165,119 +1104,104 @@ def main():
             raise SystemExit("Assistants mode requires --assistant-id and will NOT create/update.")
         try:
             oaiclient.verify_assistant_exists(args.assistant_id)
-        except RuntimeError as e:
-            raise SystemExit(str(e))
+        except RuntimeError as exc:
+            raise SystemExit(str(exc))
 
-    logger.info(f"Running {args.runs} passes per question in mode: {args.api_mode.upper()}"
-                + (f" with vector_store={args.vector_store_id}" if args.vector_store_id else ""))
+    logger.info(
+        f"Running {args.runs} passes per question in mode: {args.api_mode.upper()}"
+        + (f" with vector_store={args.vector_store_id}" if args.vector_store_id else "")
+    )
 
     # Resolve user prefix/suffix for Responses/Chat
     uprefix = args.user_prefix
     if not uprefix and args.user_prefix_file:
         try:
-            uprefix = Path(args.user_prefix_file).read_text().strip()
-        except Exception as e:
-            logger.warning(f"Could not read --user-prefix-file: {e}")
+            uprefix = Path(args.user_prefix_file).read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning(f"Could not read --user-prefix-file: {exc}")
     usuffix = args.user_suffix
     if not usuffix and args.user_suffix_file:
         try:
-            usuffix = Path(args.user_suffix_file).read_text().strip()
-        except Exception as e:
-            logger.warning(f"Could not read --user-suffix-file: {e}")
+            usuffix = Path(args.user_suffix_file).read_text(encoding="utf-8").strip()
+        except Exception as exc:
+            logger.warning(f"Could not read --user-suffix-file: {exc}")
 
-    # Evaluate
     runs_df, summary_df = evaluate_questions(
         df=df,
         runs=args.runs,
         oaiclient=oaiclient,
-        system_prompt=args.system_prompt if args.api_mode != "assistants" else None,
+        system_prompt=system_prompt if args.api_mode != "assistants" else None,
         cosine_threshold=args.cosine_threshold,
         context_precision_threshold=args.context_precision_threshold,
-        user_prefix=uprefix if args.api_mode in ("responses","chat") else None,
-        user_suffix=usuffix if args.api_mode in ("responses","chat") else None,
+        user_prefix=uprefix if args.api_mode in ("responses", "chat") else None,
+        user_suffix=usuffix if args.api_mode in ("responses", "chat") else None,
         api_mode=args.api_mode,
         assistant_id=args.assistant_id,
     )
 
-    # Analysis
-    analysis_text = None
-    analysis_stats_kpi = None
-    if args.analysis_to_sheet:
-        try:
-            stats = key_stats_from_results(summary_df, runs_df)
-            analysis_text = analysis_text_from_llm(oaiclient.client, args.analysis_model, stats, max_tokens=args.analysis_max_tokens)
-            analysis_stats_kpi = kpi_dataframe_from_stats(stats)
-        except Exception as e:
-            logger.error(f"Analysis generation failed: {e}")
+    stats = key_stats_from_results(summary_df, runs_df)
+    kpi_df = kpi_dataframe_from_stats(stats)
 
-    # Excel
-    logger.info(f"Writing Excel to {args.output} ...")
-    with pd.ExcelWriter(args.output, engine="openpyxl") as writer:
+    analysis_text = None
+    analysis_error = None
+    try:
+        analysis_text = analysis_text_from_llm(
+            oaiclient.client, args.analysis_model, stats, max_tokens=args.analysis_max_tokens
+        )
+    except Exception as exc:
+        analysis_error = str(exc)
+        logger.error(f"Analysis generation failed: {exc}")
+
+    analysis_lines = analysis_text.splitlines() if analysis_text else ["(analysis unavailable)"]
+    if not analysis_lines:
+        analysis_lines = ["(analysis unavailable)"]
+    analysis_df = pd.DataFrame({"analysis": analysis_lines})
+
+    cli_params = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()}
+    cfg = {
+        "generated_at": datetime.now().isoformat(),
+        "timestamp_suffix": suffix,
+        "results_path": str(results_path),
+        "analysis_path": str(analysis_path),
+        "config_path": str(config_path),
+        "cli_parameters": cli_params,
+        "system_prompt_file": str(Path(args.system_prompt_file).resolve()),
+        "system_prompt_char_count": len(system_prompt),
+        "vector_store_id": args.vector_store_id,
+        "kpi_snapshot": stats,
+    }
+    if analysis_error:
+        cfg["analysis_generation_error"] = analysis_error
+
+    cfg_df = config_dataframe(cfg)
+
+    with pd.ExcelWriter(results_path, engine="openpyxl") as writer:
         summary_df.to_excel(writer, index=False, sheet_name="summary")
         runs_df.to_excel(writer, index=False, sheet_name="runs")
-        if analysis_text is not None:
-            import pandas as _pd
-            lines = analysis_text.splitlines() or ["(no analysis)"]
-            df_analysis = _pd.DataFrame({"Analysis": lines})
-            df_analysis.to_excel(writer, index=False, sheet_name="analysis")
-        if analysis_stats_kpi is not None:
-            analysis_stats_kpi.to_excel(writer, index=False, sheet_name="analysis_stats")
-        apply_excel_formatting(writer, summary_df, runs_df)
-    logger.info("Excel write complete.")
+        kpi_df.to_excel(writer, index=False, sheet_name="kpis")
+        analysis_df.to_excel(writer, index=False, sheet_name="analysis")
+        cfg_df.to_excel(writer, index=False, sheet_name="config")
+        apply_excel_formatting(writer, summary_df, runs_df, kpi_df, cfg_df)
+    logger.info(f"Excel write complete: {results_path}")
 
-    # Push to Google Sheet
-    if args.push_to_sheet:
-        logger.info("Pushing results back to Google Sheet as new tabs...")
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(args.service_account, scopes=scopes)
-        gc = gspread.authorize(creds)
-        ts = timestamp_str(args.timezone)
-        sum_title = f"{args.sheet_title_prefix}summary_{ts}"
-        runs_title = f"{args.sheet_title_prefix}runs_{ts}"
-        try:
-            df_to_gsheet(gc, args.sheet_id, sum_title, summary_df, logger=logger)
-            df_to_gsheet(gc, args.sheet_id, runs_title, runs_df, logger=logger)
-            logger.info(f"Created tabs: {sum_title}, {runs_title}")
-        except Exception as e:
-            logger.error(f"Failed to push summary/runs to Google Sheet: {e}")
+    analysis_md_lines = [
+        "# Analysis & Improvements",
+        "",
+        analysis_text or "_Analysis generation unavailable._",
+        "",
+        "## KPI Snapshot",
+        "```json",
+        json.dumps(stats, indent=2, ensure_ascii=False),
+        "```",
+    ]
+    analysis_path.write_text("\n".join(analysis_md_lines).strip() + "\n", encoding="utf-8")
+    logger.info(f"Saved analysis markdown: {analysis_path}")
 
-        if args.analysis_to_sheet and analysis_text is not None:
-            try:
-                analysis_title = f"{args.analysis_title_prefix}{ts}"
-                text_to_gsheet(gc, args.sheet_id, analysis_title, analysis_text, logger=logger)
-                if analysis_stats_kpi is not None:
-                    kpi_title = f"{args.analysis_title_prefix}stats_{ts}"
-                    df_to_gsheet(gc, args.sheet_id, kpi_title, analysis_stats_kpi, logger=logger)
-                logger.info(f"Created analysis tab(s): {analysis_title}")
-            except Exception as e:
-                logger.error(f"Failed to push analysis to Google Sheet: {e}")
-
-    # Save config snapshot
-    cfg = {
-        "sheet_id": args.sheet_id,
-        "worksheet": args.worksheet,
-        "model": args.model,
-        "embedding_model": args.embedding_model,
-        "judge_model": args.judge_model,  # ADDED: Include judge_model in config
-        "runs": args.runs,
-        "temperature": args.temperature,
-        "top_p": args.top_p,
-        "max_tokens": args.max_tokens,
-        "vector_store_id": args.vector_store_id,
-        "api_mode": args.api_mode,
-        "assistant_id": args.assistant_id,
-        "context_precision_threshold": args.context_precision_threshold,
-        "timestamp": int(time.time()),
-    }
-    cfg_path = os.path.splitext(args.output)[0] + "_run_config.json"
-    with open(cfg_path, "w") as f:
-        json.dump(cfg, f, indent=2)
+    with open(config_path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    logger.info(f"Saved run config: {config_path}")
 
     logger.info("Done.")
-    logger.info(f"Saved run config: {cfg_path}")
 
 
 if __name__ == "__main__":
