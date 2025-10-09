@@ -445,7 +445,18 @@ class OpenAIClient:
         }
 
     # ---- Responses API with File Search (vector store grounding) ----
-    def rag_response(self, question: str, system: Optional[str]) -> Dict[str, Any]:
+    # def rag_response(self, question: str, system: Optional[str]) -> Dict[str, Any]:
+    #     if not self.vector_store_id:
+    #         raise ValueError("vector_store_id is required for rag_response")
+
+    #     def call_with_attachments():
+    # Usage in rag_response method:
+    def rag_response(self, question: str, system: Optional[str], expects_json: bool = True) -> Dict[str, Any]:
+        """
+        Args:
+            expects_json: If True, expects JSON output format with answer_lines, citations, etc.
+                        If False, expects plain text output with file_citation annotations.
+        """
         if not self.vector_store_id:
             raise ValueError("vector_store_id is required for rag_response")
 
@@ -541,13 +552,11 @@ class OpenAIClient:
 
 
         start = time.time()
-        resp = retry_with_backoff(call_with_attachments, on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}"))
+        resp = retry_with_backoff(call_with_attachments, 
+                                on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}"))
         end = time.time()
 
-        print(f"{question}: {resp} ")
-        end = time.time()
-
-        # usage from typed object
+        # Usage from typed object
         try:
             usage = getattr(resp, "usage", None) or {}
             prompt_toks = getattr(usage, "input_tokens", None)
@@ -556,23 +565,126 @@ class OpenAIClient:
             prompt_toks = None
             completion_toks = None
 
-        # robust text + citations extraction from typed output
-        text, quotes, file_ids,follow_up,urgency = self._extract_text_and_citations_from_response_json(resp)
+        # Unified extraction
+        extracted = self._extract_response_data(resp, api_mode="responses", expects_json=expects_json)
+        
         total_toks = (prompt_toks or 0) + (completion_toks or 0)
 
-        print(f"{text}: {quotes} ")
-
         return {
-            "text": (text or "").strip(),
+            "text": extracted["text"],
             "latency_ms": (end - start) * 1000.0,
             "prompt_tokens": prompt_toks,
             "completion_tokens": completion_toks,
             "total_tokens": total_toks if total_toks else None,
-            "citations": [{"quote": q, "file_id": f} for q, f in zip(quotes, file_ids)],
-            "urgency":urgency,
-            "follow_up":follow_up
+            "citations": [{"quote": q, "file_id": f} 
+                        for q, f in zip(extracted["quotes"], extracted["file_ids"])],
+            "urgency": extracted["urgency"],
+            "follow_up": extracted["follow_up"]
         }
 
+    @staticmethod
+    def _extract_response_data(resp, api_mode: str = "responses", expects_json: bool = True) -> dict:
+        """
+        Unified extraction method for all API modes.
+        
+        Args:
+            resp: Response object from OpenAI API
+            api_mode: "responses" or "assistants"
+            expects_json: If True, attempts to parse JSON structure from response text.
+                        If False, extracts plain text with file_citation annotations.
+        
+        Returns:
+            dict with keys: text, quotes, file_ids, follow_up, urgency
+        """
+        result = {
+            "text": "",
+            "quotes": [],
+            "file_ids": [],
+            "follow_up": "",
+            "urgency": ""
+        }
+        
+        try:
+            if api_mode == "assistants":
+                # Assistants API: Extract from message content with file_citation annotations
+                text_parts = []
+                for item in getattr(resp, "content", []) or []:
+                    if getattr(item, "type", None) == "text":
+                        t = getattr(item.text, "value", "") or ""
+                        text_parts.append(t)
+                        
+                        # Extract citations from annotations
+                        for a in (getattr(item.text, "annotations", []) or []):
+                            if getattr(a, "type", None) == "file_citation":
+                                q = getattr(a, "quote", "") or ""
+                                fid = getattr(a, "file_id", "") or ""
+                                if q:
+                                    result["quotes"].append(q)
+                                    result["file_ids"].append(fid)
+                
+                result["text"] = "".join(text_parts).strip()
+                
+            elif api_mode == "responses":
+                # Step 1: Locate the response text
+                raw_text = None
+                for item in getattr(resp, "output", []) or []:
+                    if getattr(item, "type", None) == "message":
+                        for c in getattr(item, "content", []) or []:
+                            if getattr(c, "type", None) == "output_text":
+                                raw_text = getattr(c, "text", None)
+                                
+                                if not expects_json:
+                                    # Extract file_citation annotations directly
+                                    for a in (getattr(c, "annotations", []) or []):
+                                        if getattr(a, "type", None) == "file_citation":
+                                            q = getattr(a, "quote", "") or ""
+                                            fid = getattr(a, "file_id", "") or ""
+                                            if q:
+                                                result["quotes"].append(q)
+                                                result["file_ids"].append(fid)
+                                break
+                    if raw_text:
+                        break
+                
+                # Fallback: check resp.output_text (for older SDK versions)
+                if not raw_text:
+                    raw_text = getattr(resp, "output_text", None)
+                
+                if expects_json:
+                    # Step 2: Parse JSON structure
+                    data = json.loads(raw_text) if isinstance(raw_text, str) else (raw_text or {})
+                    
+                    # Step 3: Extract answer lines
+                    lines = data.get("answer_lines", [])
+                    if isinstance(lines, list):
+                        result["text"] = "\n".join(str(line) for line in lines).strip()
+                    else:
+                        result["text"] = str(lines)
+                    
+                    # Step 4: Extract citations from JSON
+                    for c in data.get("citations", []) or []:
+                        q = c.get("quote", "").strip()
+                        fid = c.get("source_id", "").strip()
+                        if q:
+                            result["quotes"].append(q)
+                            result["file_ids"].append(fid)
+                    
+                    # Step 5: Extract follow-up
+                    result["follow_up"] = data.get("follow_up", "")
+                    
+                    # Step 6: Extract urgency/escalation
+                    result["urgency"] = data.get("urgency", "")
+                else:
+                    # Plain text mode: just use the raw text
+                    result["text"] = (raw_text or "").strip()
+        
+        except Exception as e:
+            # Log parsing issue if needed
+            # print(f"Error extracting response data: {e}")
+            pass
+        
+        return result
+ 
     @staticmethod
     def _extract_text_and_citations_from_response_json(resp) -> tuple[str, list[str], list[str]]:
         """
@@ -819,30 +931,26 @@ class OpenAIClient:
         total_toks = (prompt_toks or 0) + (completion_toks or 0) if (prompt_toks is not None and completion_toks is not None) else None
 
         # Grab latest assistant message and collect file_citation quotes for Contextual Precision
+        # Grab latest assistant message
         msgs = self.client.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
-        text = ""
-        quotes, file_ids = [], []
+        
         if msgs.data:
             msg = msgs.data[0]
-            for block in msg.content or []:
-                if getattr(block, "type", None) == "text":
-                    text += getattr(block.text, "value", "") or ""
-                    for a in (getattr(block.text, "annotations", []) or []):
-                        if getattr(a, "type", None) == "file_citation":
-                            q = getattr(a, "quote", "") or ""
-                            fid = getattr(a, "file_id", "") or ""
-                            if q:
-                                quotes.append(q)
-                                file_ids.append(fid)
-
-        end = _time.time()
+            extracted = self._extract_response_data(msg, api_mode="assistants")
+        else:
+            extracted = {"text": "", "quotes": [], "file_ids": [], "follow_up": "", "urgency": ""}
+        
+        end = time.time()
         return {
-            "text": text.strip(),
+            "text": extracted["text"],
             "latency_ms": (end - start) * 1000.0,
             "prompt_tokens": prompt_toks,
             "completion_tokens": completion_toks,
             "total_tokens": total_toks,
-            "citations": [{"quote": q, "file_id": f} for q, f in zip(quotes, file_ids)],
+            "citations": [{"quote": q, "file_id": f} 
+                        for q, f in zip(extracted["quotes"], extracted["file_ids"])],
+            "urgency": extracted["urgency"],
+            "follow_up": extracted["follow_up"]
         }
 
 
