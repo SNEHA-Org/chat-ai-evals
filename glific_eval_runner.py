@@ -342,14 +342,6 @@ class OpenAIClient:
             "total_tokens": total_toks,
             "citations": [],
         }
-
-    # ---- Responses API with File Search (vector store grounding) ----
-    # def rag_response(self, question: str, system: Optional[str]) -> Dict[str, Any]:
-    #     if not self.vector_store_id:
-    #         raise ValueError("vector_store_id is required for rag_response")
-
-    #     def call_with_attachments():
-    # Usage in rag_response method:
     def rag_response(self, question: str, system: Optional[str], expects_json: bool = True) -> Dict[str, Any]:
         """
         Args:
@@ -366,22 +358,19 @@ class OpenAIClient:
                 input=[
                     {
                         "role": "system",
-                        "content": system or self.system_prompt or "You are a helpful assistant."
+                        "content": self.system_prompt
                     },
                     {
                         "role": "user",
                         "content": question,
                     },
                 ],
-                # Tools are declared top-level
                 tools=[{
                     "type": "file_search",
                     "vector_store_ids": [self.vector_store_id],
-                    "max_num_results": 20
+                    "max_num_results": 20   # cap results
                 }],
-                tool_choice={
-                    "type": "file_search"
-                },
+                tool_choice={"type": "file_search"},  # force retrieval
                 temperature=self.temperature,
                 top_p=self.top_p,
                 max_output_tokens=self.max_tokens,
@@ -394,6 +383,15 @@ class OpenAIClient:
         end = time.time()
         
         print(f"{question}: {resp} ")
+        msg = next(o for o in resp.output if o.type == "message")
+        for part in msg.content:
+            if part.type == "output_text":
+                print(part.text)
+                anns = getattr(part, "annotations", []) or []
+                for a in anns:
+                    if a.type == "file_citation":
+                        print("CITATION → file_id:", a.file_id, "quote:", getattr(a, "quote", ""))
+
         
         # Usage from typed object
         try:
@@ -944,7 +942,7 @@ def parse_args():
     p.add_argument("--runs", type=int, default=5, help="Number of runs per question. Default: 20")
     p.add_argument("--temperature", type=float, default=0.01, help="Sampling temperature (for Responses/Chat).")
     p.add_argument("--top-p", type=float, default=1, help="Top-p (for Responses/Chat).")
-    p.add_argument("--max-tokens", type=int, default=512, help="Max tokens for the completion.")
+    p.add_argument("--max-tokens", type=int, default=1024, help="Max tokens for the completion.")
     p.add_argument("--system-prompt", default=None, help="Optional system prompt (Responses/Chat mode only).")
     p.add_argument("--vector-store-id", default=None, help="If set, enable File Search with this Vector Store ID (Responses/Assistants).")
     # Thresholds
@@ -1002,6 +1000,16 @@ def main():
         judge_temperature=0.01,
         system_prompt=system_prompt_resolved
     )
+
+    # Confirm the vector store contains files and is indexed
+    vs = oaiclient.client.vector_stores.retrieve(oaiclient.vector_store_id)
+    print(vs)  # look for file counts / status
+
+    #  List files and check their statuses
+    files = oaiclient.client.vector_stores.files.list(vector_store_id=oaiclient.vector_store_id)
+    for f in files.data:
+        print(f.id, f.status)
+    # All should be "completed"
 
     # Mode note
     if args.api_mode == "assistants":
