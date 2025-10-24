@@ -28,7 +28,7 @@ python3 glific_eval_runner.py \
   --embedding-model text-embedding-3-large \
   --runs 1 \
   --temperature 0.01 \
-  --vector-store-id vs_67a9de6638888191beb37c06f84e1a88 \
+  --vector-store-id vs_xxxxx \
   --system-prompt prompts/prompt_new.md --analysis-to-sheet
 
 python3 glific_eval_runner_gsheet.py \
