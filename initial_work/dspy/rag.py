@@ -15,7 +15,7 @@ lm = dspy.LM(
 dspy.configure(lm=lm)
 
 # load the golden question/answer pairs in dspy.Examples
-data = pd.read_csv('examples.csv')
+data = pd.read_csv('goldenset/examples.csv')
 
 examples = []
 for index, row in data.iterrows():
