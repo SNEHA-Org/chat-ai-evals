@@ -71,6 +71,12 @@ def cosine_similarity(a: List[float], b: List[float]) -> float:
     return dot / (na * nb)
 
 
+def model_supports_sampling_params(model: str) -> bool:
+    """gpt-5+ and o-series reasoning models (o1/o3/o4-mini/...) reject temperature/top_p."""
+    m = (model or "").lower()
+    return not re.match(r"^(gpt-5|o1|o3|o4)", m)
+
+
 def retry_with_backoff(fn, *, retries=5, base_delay=1.0, exceptions=(Exception,), on_error=None):
     attempt = 0
     while True:
@@ -266,15 +272,17 @@ Write:
 4) 2 watchouts on Safety/Clarity/Completeness/Correctness.
 Skip any metric that is null.
 """
-    resp = openai_client.chat.completions.create(
+    kwargs = dict(
         model=analysis_model,
         messages=[
             {"role": "system", "content": sys},
             {"role": "user", "content": user.strip()},
         ],
-        temperature=0.2,
         max_tokens=max_tokens,
     )
+    if model_supports_sampling_params(analysis_model):
+        kwargs["temperature"] = 0.2
+    resp = openai_client.chat.completions.create(**kwargs)
     return (resp.choices[0].message.content or "").strip()
 
 def load_csv_as_dataframe(csv_path: str) -> pd.DataFrame:
@@ -319,17 +327,19 @@ class OpenAIClient:
     # ---- Chat (no vector store) ----
     def chat_completion(self, question: str, system: Optional[str], seed: Optional[int]) -> Dict[str, Any]:
         def _call():
-            return self.client.chat.completions.create(
+            kwargs = dict(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": system or "You are a helpful assistant that answers clearly and concisely."},
                     {"role": "user", "content": question},
                 ],
-                temperature=self.temperature,
-                top_p=self.top_p,
                 max_tokens=self.max_tokens,
                 seed=seed,
             )
+            if model_supports_sampling_params(self.model):
+                kwargs["temperature"] = self.temperature
+                kwargs["top_p"] = self.top_p
+            return self.client.chat.completions.create(**kwargs)
         start = time.time()
         resp = retry_with_backoff(_call, on_error=lambda e, a: print(f"[chat] Retry {a} after error: {e}"))
         end = time.time()
@@ -357,7 +367,7 @@ class OpenAIClient:
             raise ValueError("vector_store_id is required for rag_response")
 
         def call_with_attachments():
-            return self.client.responses.create(
+            kwargs = dict(
                 model=self.model,
                 # Put the system + user as two messages
                 input=[
@@ -376,27 +386,45 @@ class OpenAIClient:
                     "max_num_results": 5,  # cap results
                 }],
                 tool_choice={"type": "file_search"},  # force retrieval
-                temperature=self.temperature,
-                top_p=self.top_p,
                 max_output_tokens=self.max_tokens,
             )
+            if model_supports_sampling_params(self.model):
+                kwargs["temperature"] = self.temperature
+                kwargs["top_p"] = self.top_p
+            else:
+                # Reasoning models: keep effort low so tokens go to the answer,
+                # not hidden reasoning (max_output_tokens covers both).
+                kwargs["reasoning"] = {"effort": "low"}
+            return self.client.responses.create(**kwargs)
 
         start = time.time()
-        resp = retry_with_backoff(call_with_attachments, 
+        resp = retry_with_backoff(call_with_attachments,
                                 on_error=lambda e, a: print(f"[responses] Retry {a} after error: {e}"))
         end = time.time()
-        
-        print(f"{question}: {resp} ")
-        msg = next(o for o in resp.output if o.type == "message")
-        for part in msg.content:
-            if part.type == "output_text":
-                print(part.text)
-                anns = getattr(part, "annotations", []) or []
-                for a in anns:
-                    if a.type == "file_citation":
-                        print("CITATION → file_id:", a.file_id, "quote:", getattr(a, "filename", ""))
 
-        
+        usage = getattr(resp, "usage", None)
+        reasoning_toks = getattr(getattr(usage, "output_tokens_details", None), "reasoning_tokens", None)
+        print(f"{question}: status={getattr(resp, 'status', None)} "
+              f"output_items={[getattr(o, 'type', None) for o in (resp.output or [])]} "
+              f"reasoning_tokens={reasoning_toks}")
+        msg = next((o for o in resp.output if o.type == "message"), None)
+        if msg is None:
+            status = getattr(resp, "status", None)
+            incomplete = getattr(resp, "incomplete_details", None)
+            reason = getattr(incomplete, "reason", None) if incomplete else None
+            print(f"[warn] No 'message' item in response.output (status={status}, incomplete_reason={reason}). "
+                  f"For reasoning models (gpt-5/o-series), reasoning tokens count against max_output_tokens; "
+                  f"try increasing --max-tokens if reason is 'max_output_tokens'.")
+        else:
+            for part in msg.content:
+                if part.type == "output_text":
+                    print(part.text)
+                    anns = getattr(part, "annotations", []) or []
+                    for a in anns:
+                        if a.type == "file_citation":
+                            print("CITATION → file_id:", a.file_id, "quote:", getattr(a, "filename", ""))
+
+
         # Usage from typed object
         try:
             usage = getattr(resp, "usage", None) or {}
@@ -765,16 +793,18 @@ Return ONLY a JSON object like:
 {{"safety": 1.0, "clarity": 2.5, "completeness": -0.5, "correctness": 0.5}}
 """
     try:
-        resp = oaiclient.client.chat.completions.create(
+        kwargs = dict(
             model=oaiclient.judge_model,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user.strip()},
             ],
-            temperature=0.0,
-            max_tokens=512,
+            max_tokens=2048,
             seed=0,
         )
+        if model_supports_sampling_params(oaiclient.judge_model):
+            kwargs["temperature"] = 0.0
+        resp = oaiclient.client.chat.completions.create(**kwargs)
         txt = (resp.choices[0].message.content or "").strip()
         try:
             data = json.loads(txt)
