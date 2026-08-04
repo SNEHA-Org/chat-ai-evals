@@ -51,7 +51,7 @@ oauthlib==3.3.1
 openai==2.6.1
 openpyxl==3.1.5
 optuna==4.5.0
-orjson==3.11.3
+orjson==3.11.6
 packaging==25.0
 pandas==2.3.3
 propcache==0.4.1
